@@ -67,7 +67,7 @@ type ResponsesTool = {
 
 type CodexSseEvent = {
   event: string
-  data: Record<string, any>
+  data: Record<string, unknown>
 }
 
 function makeUsage(usage?: {
@@ -566,41 +566,49 @@ async function* readSseEvents(response: Response): AsyncGenerator<CodexSseEvent>
   const decoder = new TextDecoder()
   let buffer = ''
 
-  while (true) {
-    const { done, value } = await reader.read()
-    if (done) break
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
 
-    buffer += decoder.decode(value, { stream: true })
-    const chunks = buffer.split('\n\n')
-    buffer = chunks.pop() ?? ''
+      buffer += decoder.decode(value, { stream: true })
+      const chunks = buffer.split('\n\n')
+      buffer = chunks.pop() ?? ''
 
-    for (const chunk of chunks) {
-      const lines = chunk
-        .split('\n')
-        .map(line => line.trim())
-        .filter(Boolean)
-      if (lines.length === 0) continue
+      for (const chunk of chunks) {
+        const lines = chunk
+          .split('\n')
+          .map(line => line.trim())
+          .filter(Boolean)
+        if (lines.length === 0) continue
 
-      const eventLine = lines.find(line => line.startsWith('event: '))
-      const dataLines = lines.filter(line => line.startsWith('data: '))
-      if (!eventLine || dataLines.length === 0) continue
+        const eventLine = lines.find(line => line.startsWith('event: '))
+        const dataLines = lines.filter(line => line.startsWith('data: '))
+        if (!eventLine || dataLines.length === 0) continue
 
-      const event = eventLine.slice(7).trim()
-      const rawData = dataLines.map(line => line.slice(6)).join('\n')
-      if (rawData === '[DONE]') continue
+        const event = eventLine.slice(7).trim()
+        const rawData = dataLines.map(line => line.slice(6)).join('\n')
+        if (rawData === '[DONE]') continue
 
-      let data: Record<string, any>
-      try {
-        const parsed = JSON.parse(rawData)
-        if (!parsed || typeof parsed !== 'object') continue
-        data = parsed as Record<string, any>
-      } catch {
-        continue
+        let data: Record<string, unknown>
+        try {
+          const parsed = JSON.parse(rawData)
+          if (!isRecord(parsed)) continue
+          data = parsed
+        } catch {
+          continue
+        }
+
+        yield { event, data }
       }
-
-      yield { event, data }
     }
+  } finally {
+    reader.releaseLock()
   }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
 function determineStopReason(
@@ -707,12 +715,21 @@ export async function* codexStreamToAnthropic(
     const payload = event.data
 
     if (event.event === 'response.output_item.added') {
-      const item = payload.item
+      const item = isRecord(payload.item) ? payload.item : undefined
       if (item?.type === 'function_call') {
         yield* closeActiveTextBlock()
         const blockIndex = nextContentBlockIndex++
-        const toolUseId = item.call_id ?? item.id ?? `call_${blockIndex}`
-        toolBlocksByItemId.set(String(item.id ?? toolUseId), {
+        const toolUseId =
+          typeof item.call_id === 'string'
+            ? item.call_id
+            : typeof item.id === 'string'
+              ? item.id
+              : `call_${blockIndex}`
+        const itemKey =
+          typeof item.id === 'string'
+            ? item.id
+            : toolUseId
+        toolBlocksByItemId.set(String(itemKey), {
           index: blockIndex,
           toolUseId,
         })
@@ -724,12 +741,12 @@ export async function* codexStreamToAnthropic(
           content_block: {
             type: 'tool_use',
             id: toolUseId,
-            name: item.name ?? 'tool',
+            name: typeof item.name === 'string' ? item.name : 'tool',
             input: {},
           },
         }
 
-        if (item.arguments) {
+        if (typeof item.arguments === 'string' && item.arguments.length > 0) {
           yield {
             type: 'content_block_delta',
             index: blockIndex,
@@ -744,13 +761,17 @@ export async function* codexStreamToAnthropic(
     }
 
     if (event.event === 'response.content_part.added') {
-      if (payload.part?.type === 'output_text') {
+      const part = isRecord(payload.part) ? payload.part : undefined
+      if (part?.type === 'output_text') {
         yield* startTextBlockIfNeeded()
       }
       continue
     }
 
     if (event.event === 'response.output_text.delta') {
+      if (typeof payload.delta !== 'string') {
+        continue
+      }
       yield* startTextBlockIfNeeded()
       if (activeTextBlockIndex !== null) {
         yield {
@@ -758,7 +779,7 @@ export async function* codexStreamToAnthropic(
           index: activeTextBlockIndex,
           delta: {
             type: 'text_delta',
-            text: payload.delta ?? '',
+            text: payload.delta,
           },
         }
       }
@@ -766,14 +787,17 @@ export async function* codexStreamToAnthropic(
     }
 
     if (event.event === 'response.function_call_arguments.delta') {
-      const toolBlock = toolBlocksByItemId.get(String(payload.item_id ?? ''))
+      if (typeof payload.item_id !== 'string') {
+        continue
+      }
+      const toolBlock = toolBlocksByItemId.get(payload.item_id)
       if (toolBlock) {
         yield {
           type: 'content_block_delta',
           index: toolBlock.index,
           delta: {
             type: 'input_json_delta',
-            partial_json: payload.delta ?? '',
+            partial_json: typeof payload.delta === 'string' ? payload.delta : '',
           },
         }
       }
@@ -781,15 +805,16 @@ export async function* codexStreamToAnthropic(
     }
 
     if (event.event === 'response.output_item.done') {
-      const item = payload.item
+      const item = isRecord(payload.item) ? payload.item : undefined
       if (item?.type === 'function_call') {
-        const toolBlock = toolBlocksByItemId.get(String(item.id ?? ''))
+        const itemId = typeof item.id === 'string' ? item.id : ''
+        const toolBlock = toolBlocksByItemId.get(itemId)
         if (toolBlock) {
           yield {
             type: 'content_block_stop',
             index: toolBlock.index,
           }
-          toolBlocksByItemId.delete(String(item.id))
+          toolBlocksByItemId.delete(itemId)
         }
       } else if (item?.type === 'message') {
         yield* closeActiveTextBlock()
@@ -801,14 +826,19 @@ export async function* codexStreamToAnthropic(
       event.event === 'response.completed' ||
       event.event === 'response.incomplete'
     ) {
-      finalResponse = payload.response
+      finalResponse = isRecord(payload.response)
+        ? (payload.response as Record<string, any>)
+        : undefined
       break
     }
 
     if (event.event === 'response.failed') {
+      const responsePayload = isRecord(payload.response) ? payload.response : undefined
+      const responseError = isRecord(responsePayload?.error) ? responsePayload.error : undefined
+      const payloadError = isRecord(payload.error) ? payload.error : undefined
       throw new Error(
-        payload?.response?.error?.message ??
-          payload?.error?.message ??
+        (typeof responseError?.message === 'string' ? responseError.message : undefined) ??
+          (typeof payloadError?.message === 'string' ? payloadError.message : undefined) ??
           'Codex response failed',
       )
     }

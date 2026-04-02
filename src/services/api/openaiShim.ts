@@ -126,6 +126,15 @@ function convertContentBlocks(
   return parts
 }
 
+function normalizeAssistantContent(content: unknown): string {
+  const converted = convertContentBlocks(content)
+  if (typeof converted === 'string') return converted
+  return converted
+    .filter(part => part.type === 'text')
+    .map(part => part.text ?? '')
+    .join('')
+}
+
 function convertMessages(
   messages: Array<{ role: string; message?: { role?: string; content?: unknown }; content?: unknown }>,
   system: unknown,
@@ -187,7 +196,7 @@ function convertMessages(
 
         const assistantMsg: OpenAIMessage = {
           role: 'assistant',
-          content: convertContentBlocks(textContent) as string,
+          content: normalizeAssistantContent(textContent),
         }
 
         if (toolUses.length > 0) {
@@ -216,7 +225,7 @@ function convertMessages(
       } else {
         result.push({
           role: 'assistant',
-          content: convertContentBlocks(content) as string,
+          content: normalizeAssistantContent(content),
         })
       }
     }
@@ -343,10 +352,12 @@ async function* openaiStreamToAnthropic(
   const messageId = makeMessageId()
   let contentBlockIndex = 0
   const activeToolCalls = new Map<number, { id: string; name: string; index: number }>()
+  const pendingToolCallDeltas = new Map<number, string[]>()
   let hasEmittedContentStart = false
   let lastStopReason: 'tool_use' | 'max_tokens' | 'end_turn' | null = null
   let hasEmittedFinalUsage = false
   let hasProcessedFinishReason = false
+  let pendingFinalUsage: Partial<AnthropicUsage> | undefined
 
   // Emit message_start
   yield {
@@ -374,160 +385,177 @@ async function* openaiStreamToAnthropic(
   const decoder = new TextDecoder()
   let buffer = ''
 
-  while (true) {
-    const { done, value } = await reader.read()
-    if (done) break
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
 
-    buffer += decoder.decode(value, { stream: true })
-    const lines = buffer.split('\n')
-    buffer = lines.pop() ?? ''
+      buffer += decoder.decode(value, { stream: true })
+      const lines = buffer.split('\n')
+      buffer = lines.pop() ?? ''
 
-    for (const line of lines) {
-      const trimmed = line.trim()
-      if (!trimmed || trimmed === 'data: [DONE]') continue
-      if (!trimmed.startsWith('data: ')) continue
+      for (const line of lines) {
+        const trimmed = line.trim()
+        if (!trimmed || trimmed === 'data: [DONE]') continue
+        if (!trimmed.startsWith('data: ')) continue
 
-      let chunk: OpenAIStreamChunk
-      try {
-        chunk = JSON.parse(trimmed.slice(6))
-      } catch {
-        continue
-      }
-
-      const chunkUsage = convertChunkUsage(chunk.usage)
-
-      for (const choice of chunk.choices ?? []) {
-        const delta = choice.delta
-
-        // Text content — use != null to distinguish absent field from empty string,
-        // some providers send "" as first delta to signal streaming start
-        if (delta.content != null) {
-          if (!hasEmittedContentStart) {
-            yield {
-              type: 'content_block_start',
-              index: contentBlockIndex,
-              content_block: { type: 'text', text: '' },
-            }
-            hasEmittedContentStart = true
-          }
-          yield {
-            type: 'content_block_delta',
-            index: contentBlockIndex,
-            delta: { type: 'text_delta', text: delta.content },
-          }
+        let chunk: OpenAIStreamChunk
+        try {
+          chunk = JSON.parse(trimmed.slice(6))
+        } catch {
+          continue
         }
 
-        // Tool calls
-        if (delta.tool_calls) {
-          for (const tc of delta.tool_calls) {
-            if (tc.id && tc.function?.name) {
-              // New tool call starting
-              if (hasEmittedContentStart) {
-                yield {
-                  type: 'content_block_stop',
-                  index: contentBlockIndex,
-                }
-                contentBlockIndex++
-                hasEmittedContentStart = false
-              }
+        const chunkUsage = convertChunkUsage(chunk.usage)
 
-              const toolBlockIndex = contentBlockIndex
-              activeToolCalls.set(tc.index, {
-                id: tc.id,
-                name: tc.function.name,
-                index: toolBlockIndex,
-              })
+        for (const choice of chunk.choices ?? []) {
+          const delta = choice.delta
 
+          // Text content — use != null to distinguish absent field from empty string,
+          // some providers send "" as first delta to signal streaming start
+          if (delta.content != null) {
+            if (!hasEmittedContentStart) {
               yield {
                 type: 'content_block_start',
-                index: toolBlockIndex,
-                content_block: {
-                  type: 'tool_use',
+                index: contentBlockIndex,
+                content_block: { type: 'text', text: '' },
+              }
+              hasEmittedContentStart = true
+            }
+            yield {
+              type: 'content_block_delta',
+              index: contentBlockIndex,
+              delta: { type: 'text_delta', text: delta.content },
+            }
+          }
+
+          // Tool calls
+          if (delta.tool_calls) {
+            for (const tc of delta.tool_calls) {
+              if (tc.id && tc.function?.name) {
+                // New tool call starting
+                if (hasEmittedContentStart) {
+                  yield {
+                    type: 'content_block_stop',
+                    index: contentBlockIndex,
+                  }
+                  contentBlockIndex++
+                  hasEmittedContentStart = false
+                }
+
+                const toolBlockIndex = contentBlockIndex
+                activeToolCalls.set(tc.index, {
                   id: tc.id,
                   name: tc.function.name,
-                  input: {},
-                  ...(tc.extra_content ? { extra_content: tc.extra_content } : {}),
-                },
-              }
-              contentBlockIndex++
-
-              // Emit any initial arguments
-              if (tc.function.arguments) {
-                yield {
-                  type: 'content_block_delta',
                   index: toolBlockIndex,
-                  delta: {
-                    type: 'input_json_delta',
-                    partial_json: tc.function.arguments,
-                  },
-                }
-              }
-            } else if (tc.function?.arguments) {
-              // Continuation of existing tool call
-              const active = activeToolCalls.get(tc.index)
-              if (active) {
+                })
+
                 yield {
-                  type: 'content_block_delta',
-                  index: active.index,
-                  delta: {
-                    type: 'input_json_delta',
-                    partial_json: tc.function.arguments,
+                  type: 'content_block_start',
+                  index: toolBlockIndex,
+                  content_block: {
+                    type: 'tool_use',
+                    id: tc.id,
+                    name: tc.function.name,
+                    input: {},
+                    ...(tc.extra_content ? { extra_content: tc.extra_content } : {}),
                   },
+                }
+                contentBlockIndex++
+
+                const bufferedDeltas = pendingToolCallDeltas.get(tc.index) ?? []
+                if (tc.function.arguments) {
+                  bufferedDeltas.push(tc.function.arguments)
+                }
+                for (const partialJson of bufferedDeltas) {
+                  yield {
+                    type: 'content_block_delta',
+                    index: toolBlockIndex,
+                    delta: {
+                      type: 'input_json_delta',
+                      partial_json: partialJson,
+                    },
+                  }
+                }
+                pendingToolCallDeltas.delete(tc.index)
+              } else if (tc.function?.arguments) {
+                // Continuation of existing tool call
+                const active = activeToolCalls.get(tc.index)
+                if (active) {
+                  yield {
+                    type: 'content_block_delta',
+                    index: active.index,
+                    delta: {
+                      type: 'input_json_delta',
+                      partial_json: tc.function.arguments,
+                    },
+                  }
+                } else {
+                  const buffered = pendingToolCallDeltas.get(tc.index) ?? []
+                  buffered.push(tc.function.arguments)
+                  pendingToolCallDeltas.set(tc.index, buffered)
                 }
               }
             }
           }
-        }
 
-        // Finish — guard ensures we only process finish_reason once even if
-        // multiple chunks arrive with finish_reason set (some providers do this)
-        if (choice.finish_reason && !hasProcessedFinishReason) {
-          hasProcessedFinishReason = true
+          // Finish — guard ensures we only process finish_reason once even if
+          // multiple chunks arrive with finish_reason set (some providers do this)
+          if (choice.finish_reason && !hasProcessedFinishReason) {
+            hasProcessedFinishReason = true
 
-          // Close any open content blocks
-          if (hasEmittedContentStart) {
+            // Close any open content blocks
+            if (hasEmittedContentStart) {
+              yield {
+                type: 'content_block_stop',
+                index: contentBlockIndex,
+              }
+            }
+            // Close active tool calls
+            for (const [, tc] of activeToolCalls) {
+              yield { type: 'content_block_stop', index: tc.index }
+            }
+
+            const stopReason =
+              choice.finish_reason === 'tool_calls'
+                ? 'tool_use'
+                : choice.finish_reason === 'length'
+                  ? 'max_tokens'
+                  : 'end_turn'
+            lastStopReason = stopReason
+
             yield {
-              type: 'content_block_stop',
-              index: contentBlockIndex,
+              type: 'message_delta',
+              delta: { stop_reason: stopReason, stop_sequence: null },
+              ...(chunkUsage ?? pendingFinalUsage ? { usage: chunkUsage ?? pendingFinalUsage } : {}),
+            }
+            if (chunkUsage ?? pendingFinalUsage) {
+              hasEmittedFinalUsage = true
+              pendingFinalUsage = undefined
             }
           }
-          // Close active tool calls
-          for (const [, tc] of activeToolCalls) {
-            yield { type: 'content_block_stop', index: tc.index }
-          }
+        }
 
-          const stopReason =
-            choice.finish_reason === 'tool_calls'
-              ? 'tool_use'
-              : choice.finish_reason === 'length'
-                ? 'max_tokens'
-                : 'end_turn'
-          lastStopReason = stopReason
-
-          yield {
-            type: 'message_delta',
-            delta: { stop_reason: stopReason, stop_sequence: null },
-            ...(chunkUsage ? { usage: chunkUsage } : {}),
-          }
-          if (chunkUsage) {
+        if (
+          !hasEmittedFinalUsage &&
+          chunkUsage &&
+          (chunk.choices?.length ?? 0) === 0
+        ) {
+          pendingFinalUsage = chunkUsage
+          if (lastStopReason !== null) {
+            yield {
+              type: 'message_delta',
+              delta: { stop_reason: lastStopReason, stop_sequence: null },
+              usage: chunkUsage,
+            }
             hasEmittedFinalUsage = true
+            pendingFinalUsage = undefined
           }
         }
-      }
-
-      if (
-        !hasEmittedFinalUsage &&
-        chunkUsage &&
-        (chunk.choices?.length ?? 0) === 0
-      ) {
-        yield {
-          type: 'message_delta',
-          delta: { stop_reason: lastStopReason, stop_sequence: null },
-          usage: chunkUsage,
-        }
-        hasEmittedFinalUsage = true
       }
     }
+  } finally {
+    reader.releaseLock()
   }
 
   yield { type: 'message_stop' }
@@ -584,8 +612,37 @@ class OpenAIShimMessages {
         )
       }
 
-      const data = await response.json()
-      return self._convertNonStreamingResponse(data, request.resolvedModel)
+      const raw = await response.text()
+      let data: unknown
+      try {
+        data = JSON.parse(raw)
+      } catch {
+        const snippet = raw.slice(0, 200)
+        throw new Error(`Failed to parse OpenAI response as JSON. First 200 chars: ${snippet}`)
+      }
+      return self._convertNonStreamingResponse(
+        data as {
+          id?: string
+          model?: string
+          choices?: Array<{
+            message?: {
+              role?: string
+              content?: string | null
+              tool_calls?: Array<{
+                id: string
+                function: { name: string; arguments: string }
+                extra_content?: Record<string, unknown>
+              }>
+            }
+            finish_reason?: string
+          }>
+          usage?: {
+            prompt_tokens?: number
+            completion_tokens?: number
+          }
+        },
+        request.resolvedModel,
+      )
     })()
 
       ; (promise as unknown as Record<string, unknown>).withResponse =
