@@ -30,7 +30,7 @@ function createTempAuthJson(payload: Record<string, unknown>): string {
   return authPath
 }
 
-async function collectStreamEventTypes(responseText: string): Promise<string[]> {
+function makeResponseFromText(responseText: string): Response {
   const stream = new ReadableStream({
     start(controller) {
       controller.enqueue(new TextEncoder().encode(responseText))
@@ -38,8 +38,12 @@ async function collectStreamEventTypes(responseText: string): Promise<string[]> 
     },
   })
 
+  return new Response(stream)
+}
+
+async function collectStreamEventTypes(responseText: string): Promise<string[]> {
   const events: string[] = []
-  for await (const event of codexStreamToAnthropic(new Response(stream), 'gpt-5.4')) {
+  for await (const event of codexStreamToAnthropic(makeResponseFromText(responseText), 'gpt-5.4')) {
     events.push(event.type)
   }
   return events
@@ -228,6 +232,62 @@ describe('Codex request translation', () => {
       '',
       'event: response.completed',
       'data: {"type":"response.completed","response":{"id":"resp_1","status":"completed","model":"gpt-5.4","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}],"usage":{"input_tokens":2,"output_tokens":1}},"sequence_number":4}',
+      '',
+    ].join('\n')
+
+    const eventTypes = await collectStreamEventTypes(responseText)
+
+    expect(eventTypes).toEqual([
+      'message_start',
+      'content_block_start',
+      'content_block_delta',
+      'content_block_stop',
+      'message_delta',
+      'message_stop',
+    ])
+  })
+
+  test('releases Codex stream reader lock after iteration stops early', async () => {
+    const response = makeResponseFromText([
+      'event: response.content_part.added',
+      'data: {"type":"response.content_part.added","content_index":0,"item_id":"msg_1","output_index":0,"part":{"type":"output_text","text":""},"sequence_number":1}',
+      '',
+      'event: response.output_text.delta',
+      'data: {"type":"response.output_text.delta","content_index":0,"delta":"ok","item_id":"msg_1","output_index":0,"sequence_number":2}',
+      '',
+      'event: response.completed',
+      'data: {"type":"response.completed","response":{"id":"resp_1","status":"completed","model":"gpt-5.4","output":[],"usage":{"input_tokens":2,"output_tokens":1}},"sequence_number":4}',
+      '',
+    ].join('\n'))
+
+    for await (const event of codexStreamToAnthropic(response, 'gpt-5.4')) {
+      if (event.type === 'content_block_delta') {
+        break
+      }
+    }
+
+    expect(response.body?.locked).toBe(false)
+  })
+
+  test('skips malformed Codex SSE payloads without crashing the stream', async () => {
+    const responseText = [
+      'event: response.output_item.added',
+      'data: {}',
+      '',
+      'event: response.function_call_arguments.delta',
+      'data: {}',
+      '',
+      'event: response.output_item.done',
+      'data: {}',
+      '',
+      'event: response.output_text.delta',
+      'data: {"delta":"ok"}',
+      '',
+      'event: response.completed',
+      'data: {"response":{"id":"resp_1","status":"completed","model":"gpt-5.4","output":[],"usage":{"input_tokens":2,"output_tokens":1}}}',
+      '',
+      'event: response.output_item.added',
+      'data: {not-json}',
       '',
     ].join('\n')
 

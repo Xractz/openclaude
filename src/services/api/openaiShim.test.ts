@@ -49,6 +49,14 @@ function makeStreamChunks(chunks: unknown[]): string[] {
   ]
 }
 
+async function collectEvents(stream: AsyncIterable<Record<string, unknown>>): Promise<Array<Record<string, unknown>>> {
+  const events: Array<Record<string, unknown>> = []
+  for await (const event of stream) {
+    events.push(event)
+  }
+  return events
+}
+
 beforeEach(() => {
   process.env.OPENAI_BASE_URL = 'http://example.test/v1'
   process.env.OPENAI_API_KEY = 'test-key'
@@ -288,10 +296,7 @@ test('preserves Gemini tool call extra_content from streaming chunks', async () 
     })
     .withResponse()
 
-  const events: Array<Record<string, unknown>> = []
-  for await (const event of result.data) {
-    events.push(event)
-  }
+  const events = await collectEvents(result.data)
 
   const toolStart = events.find(
     event =>
@@ -311,4 +316,303 @@ test('preserves Gemini tool call extra_content from streaming chunks', async () 
       },
     },
   })
+})
+
+test('releases OpenAI stream reader lock after iteration stops early', async () => {
+  let streamingResponse: Response | undefined
+
+  globalThis.fetch = (async () => {
+    streamingResponse = makeSseResponse(
+      makeStreamChunks([
+        {
+          id: 'chatcmpl-1',
+          object: 'chat.completion.chunk',
+          model: 'fake-model',
+          choices: [
+            {
+              index: 0,
+              delta: { role: 'assistant', content: 'partial' },
+              finish_reason: null,
+            },
+          ],
+        },
+        {
+          id: 'chatcmpl-1',
+          object: 'chat.completion.chunk',
+          model: 'fake-model',
+          choices: [
+            {
+              index: 0,
+              delta: {},
+              finish_reason: 'stop',
+            },
+          ],
+        },
+      ]),
+    )
+
+    return streamingResponse
+  }) as FetchType
+
+  const client = createOpenAIShimClient({}) as OpenAIShimClient
+  const result = await client.beta.messages
+    .create({
+      model: 'fake-model',
+      system: 'test system',
+      messages: [{ role: 'user', content: 'hello' }],
+      max_tokens: 64,
+      stream: true,
+    })
+    .withResponse()
+
+  for await (const event of result.data) {
+    if (event.type === 'content_block_delta') {
+      break
+    }
+  }
+
+  expect(streamingResponse?.body?.locked).toBe(false)
+})
+
+test('does not emit null stop_reason when usage chunk arrives before finish chunk', async () => {
+  globalThis.fetch = (async () => {
+    const chunks = makeStreamChunks([
+      {
+        id: 'chatcmpl-1',
+        object: 'chat.completion.chunk',
+        model: 'fake-model',
+        choices: [
+          {
+            index: 0,
+            delta: { role: 'assistant', content: 'hello world' },
+            finish_reason: null,
+          },
+        ],
+      },
+      {
+        id: 'chatcmpl-1',
+        object: 'chat.completion.chunk',
+        model: 'fake-model',
+        choices: [],
+        usage: {
+          prompt_tokens: 123,
+          completion_tokens: 45,
+          total_tokens: 168,
+        },
+      },
+      {
+        id: 'chatcmpl-1',
+        object: 'chat.completion.chunk',
+        model: 'fake-model',
+        choices: [
+          {
+            index: 0,
+            delta: {},
+            finish_reason: 'stop',
+          },
+        ],
+      },
+    ])
+
+    return makeSseResponse(chunks)
+  }) as FetchType
+
+  const client = createOpenAIShimClient({}) as OpenAIShimClient
+  const result = await client.beta.messages
+    .create({
+      model: 'fake-model',
+      system: 'test system',
+      messages: [{ role: 'user', content: 'hello' }],
+      max_tokens: 64,
+      stream: true,
+    })
+    .withResponse()
+
+  const events = await collectEvents(result.data)
+  const invalidStopReason = events.find(
+    event =>
+      event.type === 'message_delta' &&
+      typeof event.delta === 'object' &&
+      event.delta !== null &&
+      (event.delta as Record<string, unknown>).stop_reason === null,
+  )
+
+  const usageEvent = events.find(
+    event => event.type === 'message_delta' && typeof event.usage === 'object' && event.usage !== null,
+  ) as { usage?: { input_tokens?: number; output_tokens?: number }; delta?: { stop_reason?: string } } | undefined
+
+  expect(invalidStopReason).toBeUndefined()
+  expect(usageEvent?.usage).toMatchObject({ input_tokens: 123, output_tokens: 45 })
+  expect(usageEvent?.delta?.stop_reason).toBe('end_turn')
+})
+
+test('buffers tool argument deltas until the tool call is registered', async () => {
+  globalThis.fetch = (async () => {
+    const chunks = makeStreamChunks([
+      {
+        id: 'chatcmpl-1',
+        object: 'chat.completion.chunk',
+        model: 'fake-model',
+        choices: [
+          {
+            index: 0,
+            delta: {
+              role: 'assistant',
+              tool_calls: [
+                {
+                  index: 1,
+                  function: {
+                    arguments: '{"command":',
+                  },
+                },
+              ],
+            },
+            finish_reason: null,
+          },
+        ],
+      },
+      {
+        id: 'chatcmpl-1',
+        object: 'chat.completion.chunk',
+        model: 'fake-model',
+        choices: [
+          {
+            index: 0,
+            delta: {
+              tool_calls: [
+                {
+                  index: 1,
+                  id: 'call_1',
+                  type: 'function',
+                  function: {
+                    name: 'Bash',
+                    arguments: '"pwd"}',
+                  },
+                },
+              ],
+            },
+            finish_reason: null,
+          },
+        ],
+      },
+      {
+        id: 'chatcmpl-1',
+        object: 'chat.completion.chunk',
+        model: 'fake-model',
+        choices: [
+          {
+            index: 0,
+            delta: {},
+            finish_reason: 'tool_calls',
+          },
+        ],
+      },
+    ])
+
+    return makeSseResponse(chunks)
+  }) as FetchType
+
+  const client = createOpenAIShimClient({}) as OpenAIShimClient
+  const result = await client.beta.messages
+    .create({
+      model: 'fake-model',
+      system: 'test system',
+      messages: [{ role: 'user', content: 'Use Bash' }],
+      max_tokens: 64,
+      stream: true,
+    })
+    .withResponse()
+
+  const events = await collectEvents(result.data)
+  const argumentDeltas = events
+    .filter(
+      event =>
+        event.type === 'content_block_delta' &&
+        typeof event.delta === 'object' &&
+        event.delta !== null &&
+        (event.delta as Record<string, unknown>).type === 'input_json_delta',
+    )
+    .map(event => (event.delta as Record<string, unknown>).partial_json)
+
+  expect(argumentDeltas).toEqual(['{"command":', '"pwd"}'])
+})
+
+test('throws a helpful error when non-streaming OpenAI response is not valid JSON', async () => {
+  globalThis.fetch = (async () =>
+    new Response('<!DOCTYPE html><html><body>bad gateway</body></html>', {
+      headers: {
+        'Content-Type': 'text/html',
+      },
+    })) as FetchType
+
+  const client = createOpenAIShimClient({}) as OpenAIShimClient
+
+  await expect(
+    client.beta.messages.create({
+      model: 'fake-model',
+      system: 'test system',
+      messages: [{ role: 'user', content: 'hello' }],
+      max_tokens: 64,
+      stream: false,
+    }),
+  ).rejects.toThrow(/Failed to parse OpenAI response as JSON/)
+})
+
+test('normalizes assistant text blocks to string content in outgoing OpenAI messages', async () => {
+  let requestBody: Record<string, unknown> | undefined
+
+  globalThis.fetch = (async (_input, init) => {
+    requestBody = JSON.parse(String(init?.body))
+
+    return new Response(
+      JSON.stringify({
+        id: 'chatcmpl-1',
+        model: 'fake-model',
+        choices: [
+          {
+            message: {
+              role: 'assistant',
+              content: 'done',
+            },
+            finish_reason: 'stop',
+          },
+        ],
+        usage: {
+          prompt_tokens: 12,
+          completion_tokens: 4,
+          total_tokens: 16,
+        },
+      }),
+      {
+        headers: {
+          'Content-Type': 'application/json',
+        },
+      },
+    )
+  }) as FetchType
+
+  const client = createOpenAIShimClient({}) as OpenAIShimClient
+
+  await client.beta.messages.create({
+    model: 'fake-model',
+    system: 'test system',
+    messages: [
+      { role: 'user', content: 'hello' },
+      {
+        role: 'assistant',
+        content: [
+          { type: 'text', text: 'first line' },
+          { type: 'text', text: 'second line' },
+        ],
+      },
+    ],
+    max_tokens: 64,
+    stream: false,
+  })
+
+  const assistantMessage = (requestBody?.messages as Array<Record<string, unknown>>).find(
+    message => message.role === 'assistant',
+  )
+
+  expect(assistantMessage?.content).toBe('first linesecond line')
 })
